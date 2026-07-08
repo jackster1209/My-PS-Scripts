@@ -13,9 +13,12 @@ BeforeAll {
     # Resolve-DnsName is a Windows-only (DnsClient module) cmdlet not
     # present on non-Windows hosts; Pester's Mock needs *something* to
     # shadow, so pre-declare a stub when the real cmdlet isn't available.
-    # Test-Connection is a real cross-platform PS7 cmdlet, no stub needed.
+    # Test-NetConnection is likewise Windows-only (NetTCPIP module).
     if (-not (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue)) {
         function Resolve-DnsName { param() }
+    }
+    if (-not (Get-Command Test-NetConnection -ErrorAction SilentlyContinue)) {
+        function Test-NetConnection { param() }
     }
 
     . "$PSScriptRoot/Invoke-DnsDhcpDiagnostics.ps1"
@@ -71,6 +74,29 @@ Describe 'Get-ComputerAccountName' {
     }
     It 'appends $ to a bare hostname' {
         Get-ComputerAccountName -ComputerName 'DHCP01' | Should -Be 'DHCP01$'
+    }
+}
+
+Describe 'ConvertTo-DnsRecordDataText' {
+    It 'extracts IPv4Address for an A record' {
+        $data = [PSCustomObject]@{ IPv4Address = [System.Net.IPAddress]::Parse('10.0.0.5') }
+        ConvertTo-DnsRecordDataText -RecordType 'A' -RecordData $data | Should -Be '10.0.0.5'
+    }
+    It 'extracts PtrDomainName for a PTR record' {
+        $data = [PSCustomObject]@{ PtrDomainName = 'host.contoso.com.' }
+        ConvertTo-DnsRecordDataText -RecordType 'PTR' -RecordData $data | Should -Be 'host.contoso.com.'
+    }
+    It 'extracts NameServer for an NS record' {
+        $data = [PSCustomObject]@{ NameServer = 'ns1.contoso.com.' }
+        ConvertTo-DnsRecordDataText -RecordType 'NS' -RecordData $data | Should -Be 'ns1.contoso.com.'
+    }
+    It 'falls back to .ToString() for an unrecognized record type' {
+        $data = [PSCustomObject]@{ SomeField = 'x' }
+        # PSCustomObject's ToString() is empty-ish but must not throw.
+        { ConvertTo-DnsRecordDataText -RecordType 'CAA' -RecordData $data } | Should -Not -Throw
+    }
+    It 'returns $null for $null record data' {
+        ConvertTo-DnsRecordDataText -RecordType 'A' -RecordData $null | Should -BeNullOrEmpty
     }
 }
 
@@ -391,16 +417,25 @@ Describe 'Test-DhcpOptionsAudit' {
         $r = @(Test-DhcpOptionsAudit -ComputerName 'dhcp1' -ScopeDetail $scope -KnownDnsServers @('10.0.0.1'))
         ($r | Where-Object TestName -eq 'Option 006 DNS Servers').Status | Should -Be 'Warn'
     }
+    It 'reuses a shared DnsAnswerCache instead of re-probing the same IP' {
+        Mock Resolve-DnsName { [PSCustomObject]@{ Type = 'NS' } }
+        $sharedCache = @{}
+        $scope1 = [PSCustomObject]@{ ScopeId = '10.0.0.0'; Options = @([PSCustomObject]@{ OptionId = 6; Name = 'DNS Servers'; Value = @('10.0.0.1') }) }
+        $scope2 = [PSCustomObject]@{ ScopeId = '10.0.1.0'; Options = @([PSCustomObject]@{ OptionId = 6; Name = 'DNS Servers'; Value = @('10.0.0.1') }) }
+        Test-DhcpOptionsAudit -ComputerName 'dhcp1' -ScopeDetail $scope1 -KnownDnsServers @('10.0.0.1') -DnsAnswerCache $sharedCache | Out-Null
+        Test-DhcpOptionsAudit -ComputerName 'dhcp1' -ScopeDetail $scope2 -KnownDnsServers @('10.0.0.1') -DnsAnswerCache $sharedCache | Out-Null
+        Should -Invoke Resolve-DnsName -Times 1 -Exactly
+    }
 }
 
 Describe 'Test-DhcpFailover' {
-    It 'Passes when a failover partner is reachable' {
-        Mock Test-Connection { $true }
+    It 'Passes when a failover partner is reachable on the failover port' {
+        Mock Test-NetConnection { $true }
         $scope = [PSCustomObject]@{ ScopeId = '10.0.0.0'; FailoverRelationship = 'rel1'; FailoverMode = 'LoadBalance'; FailoverPartner = 'dhcp2'; FailoverState = 'Normal' }
         (Test-DhcpFailover -ComputerName 'dhcp1' -ScopeDetail $scope -ServerHasAnyFailover $true).Status | Should -Be 'Pass'
     }
-    It 'Fails when a failover partner is unreachable' {
-        Mock Test-Connection { $false }
+    It 'Fails when a failover partner is unreachable on the failover port' {
+        Mock Test-NetConnection { $false }
         $scope = [PSCustomObject]@{ ScopeId = '10.0.0.0'; FailoverRelationship = 'rel1'; FailoverMode = 'LoadBalance'; FailoverPartner = 'dhcp2'; FailoverState = 'Normal' }
         (Test-DhcpFailover -ComputerName 'dhcp1' -ScopeDetail $scope -ServerHasAnyFailover $true).Status | Should -Be 'Fail'
     }

@@ -34,12 +34,15 @@
     Include in-addr.arpa/ip6.arpa reverse lookup zones. Off by default to
     keep default runs fast; also gates the PTR-coverage and PTR/A
     cross-check tests, which only run when reverse zones are in scope.
+    Automatically enabled when -Tests includes Ddns, since the PTR
+    coverage test (design section 5.4) is a permanent no-op without them.
 
 .PARAMETER Tests
     Which test groups to run: Dns, Dhcp, Ddns, or All (default). Ddns
     (design section 5.4) needs both DNS and DHCP data to correlate, so
-    selecting it also triggers the base Dns/Dhcp collection even if those
-    groups weren't explicitly requested.
+    selecting it also triggers the base Dns/Dhcp collection (and reverse
+    zone collection, for PTR coverage) even if those weren't explicitly
+    requested.
 
 .PARAMETER Mode
     Report (console only), Export (CSV/HTML only), or Both (default).
@@ -237,6 +240,38 @@ function Get-ComputerAccountName {
     param([Parameter(Mandatory)] [string] $ComputerName)
 
     "$(($ComputerName -split '\.')[0])`$"
+}
+
+function ConvertTo-DnsRecordDataText {
+    # Get-DnsServerResourceRecord's RecordData is a type-specific CimInstance
+    # (DnsServerResourceRecordA, ...PTR, ...NS, etc.) whose .ToString() does
+    # not reliably return the actual value (IP/target hostname) — callers
+    # that compare or match record data (the PTR/A cross-check, delegation
+    # NS targets) need the real typed property, not a generic string dump.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $RecordType,
+        [Parameter(Mandatory)] [AllowNull()] $RecordData
+    )
+
+    if ($null -eq $RecordData) { return $null }
+
+    try {
+        switch ($RecordType) {
+            'A' { return $RecordData.IPv4Address.ToString() }
+            'AAAA' { return $RecordData.IPv6Address.ToString() }
+            'PTR' { return $RecordData.PtrDomainName }
+            'NS' { return $RecordData.NameServer }
+            'CNAME' { return $RecordData.HostNameAlias }
+            'MX' { return $RecordData.MailExchange }
+            'SRV' { return $RecordData.DomainName }
+            'TXT' { return ($RecordData.DescriptiveText -join ' ') }
+            'SOA' { return $RecordData.PrimaryServer }
+        }
+    }
+    catch { }
+
+    $RecordData.ToString()
 }
 
 function Invoke-Analyzer {
@@ -516,7 +551,10 @@ function Get-DnsInventory {
 
     $nicIPs = @()
     try {
-        $nicIPs = @(Get-CimInstance -ComputerName $ComputerName -ClassName Win32_NetworkAdapterConfiguration `
+        # @cimParam (not -ComputerName) so this honors -Credential the same
+        # way every other call in this function does — Get-CimInstance
+        # supports -CimSession directly, unlike Get-Service below.
+        $nicIPs = @(Get-CimInstance @cimParam -ClassName Win32_NetworkAdapterConfiguration `
                 -Filter 'IPEnabled=True' -ErrorAction Stop | Select-Object -ExpandProperty IPAddress |
                 Where-Object { $_ -match '\.' })
     }
@@ -526,7 +564,9 @@ function Get-DnsInventory {
 
     $serviceState = $null
     try {
-        $serviceState = (Get-Service -ComputerName $ComputerName -Name DNS -ErrorAction Stop).Status
+        # Win32_Service via CIM (not Get-Service -ComputerName, which has no
+        # -CimSession/-Credential support) so this also honors -Credential.
+        $serviceState = (Get-CimInstance @cimParam -ClassName Win32_Service -Filter "Name='DNS'" -ErrorAction Stop).State
     }
     catch {
         Write-DiagLog "Get-DnsInventory: could not query DNS service state on $ComputerName : $($_.Exception.Message)" 'WARN'
@@ -590,7 +630,7 @@ function Get-DnsRecordDump {
         Select-Object @{n = 'DnsServer'; e = { $ComputerName } }, @{n = 'ZoneName'; e = { $ZoneName } },
             HostName, RecordType, Timestamp, TimeToLive,
             @{n = 'IsStatic'; e = { -not $_.Timestamp } },
-            @{n = 'RecordData'; e = { $_.RecordData.ToString() } }
+            @{n = 'RecordData'; e = { ConvertTo-DnsRecordDataText -RecordType $_.RecordType -RecordData $_.RecordData } }
 }
 
 function Get-DhcpInventory {
@@ -617,7 +657,9 @@ function Get-DhcpInventory {
 
     $serviceState = $null
     try {
-        $serviceState = (Get-Service -ComputerName $ComputerName -Name DHCPServer -ErrorAction Stop).Status
+        # Win32_Service via CIM (not Get-Service -ComputerName, which has no
+        # -CimSession/-Credential support) so this honors -Credential too.
+        $serviceState = (Get-CimInstance @cimParam -ClassName Win32_Service -Filter "Name='DHCPServer'" -ErrorAction Stop).State
     }
     catch {
         Write-DiagLog "Get-DhcpInventory: could not query DHCPServer service state on $ComputerName : $($_.Exception.Message)" 'WARN'
@@ -1185,7 +1227,7 @@ function Test-DnsZoneAging {
 
     New-DiagResult -Category 'DNS' -TestName 'Zone Aging Configuration' -Target "$ComputerName\$ZoneName" `
         -Status 'Pass' -Finding "Aging enabled: no-refresh $($ZoneDetail.NoRefreshInterval), refresh $($ZoneDetail.RefreshInterval)." `
-        -Detail 'DHCP lease duration alignment check arrives in Phase 3.'
+        -Detail 'See the DDNS Lease/Aging Alignment finding for the DHCP lease duration cross-check.'
 }
 
 function Test-DnsStaleRecords {
@@ -1427,7 +1469,11 @@ function Test-DhcpOptionsAudit {
     param(
         [Parameter(Mandatory)] [string] $ComputerName,
         [Parameter(Mandatory)] $ScopeDetail,
-        [string[]] $KnownDnsServers
+        [string[]] $KnownDnsServers,
+        # Memoizes per-IP answer results across calls so N scopes pointing at
+        # the same DNS server(s) don't re-probe them N times. Caller-supplied
+        # so the cache is shared across the whole run, not just one call.
+        [hashtable] $DnsAnswerCache = @{}
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -1450,12 +1496,16 @@ function Test-DhcpOptionsAudit {
     }
     else {
         foreach ($dnsIp in $dnsOption.Value) {
-            $answers = $false
-            try {
-                $null = Resolve-DnsName -Server $dnsIp -Name '.' -Type NS -QuickTimeout -ErrorAction Stop
-                $answers = $true
+            if (-not $DnsAnswerCache.ContainsKey($dnsIp)) {
+                $answers = $false
+                try {
+                    $null = Resolve-DnsName -Server $dnsIp -Name '.' -Type NS -QuickTimeout -ErrorAction Stop
+                    $answers = $true
+                }
+                catch { $answers = $false }
+                $DnsAnswerCache[$dnsIp] = $answers
             }
-            catch { $answers = $false }
+            $answers = $DnsAnswerCache[$dnsIp]
 
             if (-not $answers) {
                 $results.Add((New-DiagResult -Category 'DHCP' -TestName 'Option 006 DNS Servers' -Target "$ComputerName\$($ScopeDetail.ScopeId) -> $dnsIp" `
@@ -1486,7 +1536,10 @@ function Test-DhcpFailover {
     if ($ScopeDetail.FailoverRelationship) {
         $partnerReachable = $false
         try {
-            $partnerReachable = [bool](Test-Connection -ComputerName $ScopeDetail.FailoverPartner -Count 1 -Quiet -ErrorAction Stop)
+            # TCP 647 (the DHCP failover protocol port), not ICMP — a host
+            # can block ping while failover traffic still flows, or vice
+            # versa; the port check reflects what actually matters here.
+            $partnerReachable = [bool](Test-NetConnection -ComputerName $ScopeDetail.FailoverPartner -Port 647 -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction Stop)
         }
         catch { $partnerReachable = $false }
 
@@ -1741,7 +1794,8 @@ function Test-DdnsPtrCoverage {
 
     if ($checked -eq 0) {
         return New-DiagResult -Category 'DDNS' -TestName 'PTR Coverage' -Target "$ComputerName\$($ScopeDetail.ScopeId)" `
-            -Status 'Info' -Finding 'No sampled leases fell inside a collected reverse zone; PTR coverage could not be verified.'
+            -Status 'Info' -Finding 'No sampled leases fell inside a collected reverse zone; PTR coverage could not be verified.' `
+            -Detail 'Reverse zone matching assumes a plain /24-style in-addr.arpa layout; classless (RFC 2317) delegations or non-/24 splits are not detected and will always land here.'
     }
 
     if ($missing.Count -gt 0) {
@@ -2031,6 +2085,16 @@ function Invoke-Main {
 
     $effectiveTests = if ($Tests -contains 'All') { @('Dns', 'Dhcp', 'Ddns') } else { $Tests }
 
+    # PTR coverage (design 5.4) is a permanent silent no-op without reverse
+    # zones, so Ddns implies -IncludeReverseZones even if the caller didn't
+    # pass it — same reasoning already applied to base Dns/Dhcp collection
+    # above (Ddns needs both sides' data to correlate).
+    $effectiveIncludeReverseZones = [bool]$IncludeReverseZones
+    if ($effectiveTests -contains 'Ddns' -and -not $IncludeReverseZones) {
+        $effectiveIncludeReverseZones = $true
+        Write-DiagLog 'Ddns tests requested: auto-enabling reverse zone collection for the PTR coverage check.'
+    }
+
     $results = [System.Collections.Generic.List[object]]::new()
     $collected = @{}
 
@@ -2073,7 +2137,7 @@ function Invoke-Main {
         $dnsWorkItems = @($reachableDns | ForEach-Object { [PSCustomObject]@{ ComputerName = $_; CimSession = $dnsCim[$_] } })
 
         $dnsJobResults = Invoke-ParallelServerCollection -InputObject $dnsWorkItems `
-            -ArgumentList @($Zone, [bool]$IncludeReverseZones, [bool]$RawDump) -ScriptBlock {
+            -ArgumentList @($Zone, $effectiveIncludeReverseZones, [bool]$RawDump) -ScriptBlock {
             param($item, $zoneFilter, $includeReverse, $rawDump)
             Get-DnsServerCollectionBundle -ComputerName $item.ComputerName -CimSession $item.CimSession `
                 -ZoneFilter $zoneFilter -IncludeReverseZones $includeReverse -RawDump $rawDump
@@ -2176,9 +2240,8 @@ function Invoke-Main {
     }
 
     # ============================================================
-    # Stage 2: Analysis — design 5.1-5.3 test catalog against the data
-    # staged above. DDNS analyzers (design 5.4) are Phase 3; the DDNS raw
-    # config gathered above is exported but not yet evaluated.
+    # Stage 2: Analysis — the full design 5.1-5.4 test catalog against the
+    # data staged above, including the DDNS tandem analyzers further down.
     # ============================================================
     Write-DiagLog 'Running analyzers.'
 
@@ -2193,6 +2256,7 @@ function Invoke-Main {
         }
     }
     $knownDnsIPs = @($knownDnsIPs | Select-Object -Unique)
+    $dnsAnswerCache = @{}
 
     # DNS server-level (5.1)
     foreach ($dnsServer in $dnsData.Keys) {
@@ -2206,7 +2270,7 @@ function Invoke-Main {
 
     # Forward A-record map per server, only needed for the PTR/A cross-check when reverse zones are in scope.
     $forwardHostnamesByIp = @{}
-    if ($IncludeReverseZones) {
+    if ($effectiveIncludeReverseZones) {
         foreach ($dnsServer in $dnsData.Keys) {
             $map = @{}
             foreach ($entry in $dnsData[$dnsServer].Zones.GetEnumerator()) {
@@ -2250,7 +2314,7 @@ function Invoke-Main {
             $scopeEntry = $dhcpData[$dhcpServer].Scopes[$scopeId]
             Invoke-Analyzer -ResultList $results -Category 'DHCP' -TestName 'Scope Utilization' -Target "$dhcpServer\$scopeId" -ScriptBlock { Test-DhcpScopeUtilization -ComputerName $dhcpServer -ScopeDetail $scopeEntry.Detail }
             Invoke-Analyzer -ResultList $results -Category 'DHCP' -TestName 'Reservations' -Target "$dhcpServer\$scopeId" -ScriptBlock { Test-DhcpReservations -ComputerName $dhcpServer -ScopeDetail $scopeEntry.Detail -Leases $scopeEntry.Leases }
-            Invoke-Analyzer -ResultList $results -Category 'DHCP' -TestName 'Options Audit' -Target "$dhcpServer\$scopeId" -ScriptBlock { Test-DhcpOptionsAudit -ComputerName $dhcpServer -ScopeDetail $scopeEntry.Detail -KnownDnsServers $knownDnsIPs }
+            Invoke-Analyzer -ResultList $results -Category 'DHCP' -TestName 'Options Audit' -Target "$dhcpServer\$scopeId" -ScriptBlock { Test-DhcpOptionsAudit -ComputerName $dhcpServer -ScopeDetail $scopeEntry.Detail -KnownDnsServers $knownDnsIPs -DnsAnswerCache $dnsAnswerCache }
             Invoke-Analyzer -ResultList $results -Category 'DHCP' -TestName 'Failover' -Target "$dhcpServer\$scopeId" -ScriptBlock { Test-DhcpFailover -ComputerName $dhcpServer -ScopeDetail $scopeEntry.Detail -ServerHasAnyFailover $serverHasAnyFailover }
             Invoke-Analyzer -ResultList $results -Category 'DHCP' -TestName 'Conflict Detection & Exclusions' -Target "$dhcpServer\$scopeId" -ScriptBlock { Test-DhcpConflictExclusions -ComputerName $dhcpServer -ScopeDetail $scopeEntry.Detail }
         }
@@ -2310,7 +2374,7 @@ function Invoke-Main {
         DnsServers         = $targets.DnsServers
         DhcpServers        = $targets.DhcpServers
         ZoneCount          = $allZoneNames.Count
-        ScopeCount         = ($dhcpData.Values | ForEach-Object { $_.Scopes.Keys }).Count
+        ScopeCount         = @($dhcpData.Values | ForEach-Object { $_.Scopes.Keys }).Count
         CredentialUserName = if ($Credential) { $Credential.UserName } else { "$env:USERDOMAIN\$env:USERNAME" }
         StartTime          = $startTime
         Duration           = $duration
