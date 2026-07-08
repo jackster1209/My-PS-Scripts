@@ -1,17 +1,115 @@
-#Requires -Version 5.1
 <#
 .SYNOPSIS
     Read-only DNS/DHCP diagnostics and reporting toolkit for Windows Server
     AD-integrated DNS and Microsoft DHCP.
 
 .DESCRIPTION
-    Gathers raw inventory/config data from DNS and DHCP servers, runs the
-    pass/warn/fail test catalog against it (design doc section 5.1-5.3),
-    and renders both a console summary and CSV exports. DDNS tandem
-    analysis (section 5.4) is not yet implemented — see
-    dns-dhcp-diagnostics-design.md sections 4 and 9 for the full roadmap.
-    This script never writes to DNS/DHCP.
+    Gathers raw inventory/config data from DNS and DHCP servers (per-server
+    collection runs in parallel via a RunspacePool, each server bounded by
+    an internal timeout so one hung host can't stall the whole run), runs
+    the full pass/warn/fail test catalog against it (design doc section
+    5.1-5.4, including the DDNS tandem tests), and renders a console
+    summary plus CSV exports and an optional self-contained HTML report.
+    Every DNS/DHCP interaction is a read-only Get-*/Resolve-DnsName/
+    Test-Connection call — this script never writes to DNS or DHCP.
+
+.PARAMETER DnsServer
+    One or more DNS servers to diagnose. Default: auto-discovered via
+    Get-ADDomainController (every DC in the current domain).
+
+.PARAMETER DhcpServer
+    One or more DHCP servers to diagnose. Default: auto-discovered via
+    Get-DhcpServerInDC (every DHCP server authorized in AD).
+
+.PARAMETER Zone
+    Restrict DNS zone-level collection/analysis to these zone names.
+    Default: all zones found on the targeted DNS servers (subject to
+    -IncludeReverseZones).
+
+.PARAMETER Scope
+    Restrict DHCP scope-level collection/analysis to these scope IDs.
+    Default: all scopes found on the targeted DHCP servers.
+
+.PARAMETER IncludeReverseZones
+    Include in-addr.arpa/ip6.arpa reverse lookup zones. Off by default to
+    keep default runs fast; also gates the PTR-coverage and PTR/A
+    cross-check tests, which only run when reverse zones are in scope.
+
+.PARAMETER Tests
+    Which test groups to run: Dns, Dhcp, Ddns, or All (default). Ddns
+    (design section 5.4) needs both DNS and DHCP data to correlate, so
+    selecting it also triggers the base Dns/Dhcp collection even if those
+    groups weren't explicitly requested.
+
+.PARAMETER Mode
+    Report (console only), Export (CSV/HTML only), or Both (default).
+
+.PARAMETER OutputPath
+    Folder for CSV/HTML/log output. Default: .\DnsDhcpReport_<timestamp>\
+    in the current directory.
+
+.PARAMETER RawDump
+    Also export full raw tabular dumps (every DNS record, every DHCP
+    lease/reservation) alongside the test-result CSVs. Off by default —
+    the underlying record/lease data is always collected for analysis
+    regardless of this switch; this only controls whether it's also
+    written to disk.
+
+.PARAMETER StaleThresholdDays
+    Age threshold (days) for the stale dynamic-record test. Default (0,
+    unset): derived per zone from that zone's own aging configuration
+    (no-refresh + refresh interval), falling back to 30 days if aging is
+    disabled or misconfigured.
+
+.PARAMETER FullOwnershipScan
+    Sample every dynamic record's AD ownership per zone instead of the
+    default 200-record random sample. Full ACL reads are slow on large
+    zones — only use this when you need exact ownership counts.
+
+.PARAMETER Credential
+    Alternate credentials for DNS/DHCP/AD queries. Passed through as CIM
+    sessions to the DNS/DHCP server cmdlets; AD cmdlets receive it
+    directly. Never logged or written to any output file.
+
+.PARAMETER PassThru
+    Return the full result-object collection to the pipeline in addition
+    to (or instead of, with -Mode Report) writing files.
+
+.PARAMETER HtmlReport
+    Also write a single self-contained Report.html (inline CSS, no
+    external assets) alongside the CSV exports. Requires -Mode Export or
+    Both.
+
+.EXAMPLE
+    .\Invoke-DnsDhcpDiagnostics.ps1
+    Default run: auto-discovers all DCs and authorized DHCP servers, runs
+    every test group against all forward zones/scopes, writes CSVs and
+    prints the console summary.
+
+.EXAMPLE
+    .\Invoke-DnsDhcpDiagnostics.ps1 -Mode Export -RawDump -HtmlReport -OutputPath C:\Diag\Run1
+    Export-only run with full raw record/lease dumps and a self-contained
+    HTML report, written to a specific folder instead of the default
+    timestamped one.
+
+.EXAMPLE
+    .\Invoke-DnsDhcpDiagnostics.ps1 -DnsServer dc1.contoso.com -Zone contoso.com -DhcpServer dhcp1.contoso.com -Scope 10.38.10.0 -Credential (Get-Credential)
+    Targeted run against one DNS server/zone and one DHCP server/scope,
+    using alternate credentials instead of the current user's context.
+
+.EXAMPLE
+    $results = .\Invoke-DnsDhcpDiagnostics.ps1 -Mode Report -PassThru
+    $results | Where-Object Status -eq 'Fail'
+    Console-only run that also returns every result object to the
+    pipeline for ad-hoc filtering — no files written.
+
+.NOTES
+    Requires the DnsServer and DhcpServer RSAT modules (the script checks
+    for these at startup and prints install guidance if missing) and,
+    for DDNS record-ownership sampling, the ActiveDirectory module.
+    PowerShell 5.1 minimum; runs unmodified on 7.x.
 #>
+#Requires -Version 5.1
 [CmdletBinding()]
 param(
     [string[]] $DnsServer,
@@ -28,12 +126,16 @@ param(
     [int] $StaleThresholdDays,
     [switch] $FullOwnershipScan,
     [pscredential] $Credential,
-    [switch] $PassThru
+    [switch] $PassThru,
+    [switch] $HtmlReport
 )
 
 $ErrorActionPreference = 'Stop'
 $script:LogFilePath = $null
 $script:OwnershipSampleSize = 200
+$script:DdnsProbeSampleSize = 50
+$script:ParallelThrottleLimit = 5
+$script:CollectionTimeoutSeconds = 120
 
 #region Shared Helpers
 
@@ -111,6 +213,32 @@ function ConvertFrom-PtrRecordToIp {
     ($zoneLabels + $HostName) -join '.'
 }
 
+function ConvertTo-PtrZoneAndHost {
+    # Inverse of ConvertFrom-PtrRecordToIp: given a dotted IPv4 address,
+    # returns the assumed /24-style reverse zone name + host label. Same
+    # best-effort limitation — classless (RFC 2317) delegations and
+    # non-/24 splits aren't detected, so callers should treat a "not found"
+    # lookup as inconclusive, not as a confirmed missing PTR.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $IPAddress)
+
+    $octets = $IPAddress -split '\.'
+    if ($octets.Count -ne 4) { return $null }
+    $zoneOctets = $octets[0..2]
+    [array]::Reverse($zoneOctets)
+    [PSCustomObject]@{ ZoneName = ($zoneOctets -join '.') + '.in-addr.arpa'; HostName = $octets[3] }
+}
+
+function Get-ComputerAccountName {
+    # AD computer accounts are named HOSTNAME$ (NetBIOS-style, no domain
+    # suffix) — used to match a DHCP server against DnsUpdateProxy
+    # membership and against record-ownership strings.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $ComputerName)
+
+    "$(($ComputerName -split '\.')[0])`$"
+}
+
 function Invoke-Analyzer {
     # Runs one analyzer call and folds its output (single result or array)
     # into $ResultList, converting an unexpected analyzer exception into an
@@ -148,6 +276,89 @@ function Add-CollectedRow {
     }
     foreach ($row in $Rows) {
         if ($null -ne $row) { $Collected[$Bucket].Add($row) }
+    }
+}
+
+function Invoke-ParallelServerCollection {
+    # Runs $ScriptBlock once per $InputObject item across a RunspacePool
+    # (same code path on PS 5.1 and 7+ — unlike ForEach-Object -Parallel,
+    # whose isolated runspaces don't see this script's custom functions
+    # without extra plumbing). Runspaces share this process, so live
+    # objects like CimSession pass through AddArgument() by reference
+    # instead of needing the serialization Start-Job would force.
+    #
+    # $ScriptBlock must take the work item as its first parameter; any
+    # $ArgumentList entries are appended as fixed extra arguments to every
+    # invocation (there's no $using: with the raw runspace-pool API).
+    # Each item gets its own timeout: a hung RPC call against a
+    # dead-but-pingable host is Stop()'d instead of blocking the batch.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $InputObject,
+        [Parameter(Mandatory)] [scriptblock] $ScriptBlock,
+        [object[]] $ArgumentList = @(),
+        [int] $ThrottleLimit = $script:ParallelThrottleLimit,
+        [int] $TimeoutSeconds = $script:CollectionTimeoutSeconds
+    )
+
+    if ($InputObject.Count -eq 0) { return @() }
+
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    foreach ($moduleName in 'DnsServer', 'DhcpServer', 'ActiveDirectory') {
+        if (Get-Module -ListAvailable -Name $moduleName) { $iss.ImportPSModule($moduleName) }
+    }
+    Get-ChildItem -Path function:\ | Where-Object { $_.ScriptBlock } | ForEach-Object {
+        try {
+            $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($_.Name, $_.Definition))
+        }
+        catch {
+            # A handful of automatic/advanced functions can't be re-hosted this way; harmless to skip.
+        }
+    }
+
+    $pool = [runspacefactory]::CreateRunspacePool(1, [Math]::Max(1, $ThrottleLimit), $iss, $Host)
+    $pool.Open()
+
+    try {
+        $jobs = foreach ($item in $InputObject) {
+            $ps = [powershell]::Create()
+            $ps.RunspacePool = $pool
+            [void]$ps.AddScript($ScriptBlock).AddArgument($item)
+            foreach ($extra in $ArgumentList) { [void]$ps.AddArgument($extra) }
+            [PSCustomObject]@{ Item = $item; PowerShell = $ps; Handle = $ps.BeginInvoke(); StartTime = Get-Date }
+        }
+
+        foreach ($job in $jobs) {
+            $deadline = $job.StartTime.AddSeconds($TimeoutSeconds)
+            while (-not $job.Handle.IsCompleted -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Milliseconds 200
+            }
+
+            if (-not $job.Handle.IsCompleted) {
+                $job.PowerShell.Stop() | Out-Null
+                [PSCustomObject]@{ Item = $job.Item; Output = $null; TimedOut = $true; Error = "Timed out after $TimeoutSeconds second(s)." }
+            }
+            else {
+                try {
+                    $output = $job.PowerShell.EndInvoke($job.Handle)
+                    $streamErrors = @($job.PowerShell.Streams.Error)
+                    [PSCustomObject]@{
+                        Item     = $job.Item
+                        Output   = $output
+                        TimedOut = $false
+                        Error    = if ($streamErrors.Count -gt 0) { ($streamErrors -join '; ') } else { $null }
+                    }
+                }
+                catch {
+                    [PSCustomObject]@{ Item = $job.Item; Output = $null; TimedOut = $false; Error = $_.Exception.Message }
+                }
+            }
+            $job.PowerShell.Dispose()
+        }
+    }
+    finally {
+        $pool.Close()
+        $pool.Dispose()
     }
 }
 
@@ -502,7 +713,10 @@ function Get-DdnsConfiguration {
         # Server-level-only lookups; avoid repeating per scope.
         $credential = Get-DhcpServerDnsCredential @cimParam -ErrorAction SilentlyContinue
         try {
-            $proxyMembers = @(Get-ADGroupMember -Identity 'DnsUpdateProxy' -ErrorAction Stop | Select-Object -ExpandProperty Name)
+            # SamAccountName (not Name/CN) so computer-account members come back
+            # as HOSTNAME$ — matching both Get-ComputerAccountName's convention
+            # and the NTAccount-style owner strings from Get-RecordOwnership.
+            $proxyMembers = @(Get-ADGroupMember -Identity 'DnsUpdateProxy' -ErrorAction Stop | Select-Object -ExpandProperty SamAccountName)
         }
         catch {
             Write-DiagLog "Get-DdnsConfiguration: could not read DnsUpdateProxy membership: $($_.Exception.Message)" 'WARN'
@@ -578,6 +792,128 @@ function Get-RecordOwnership {
             Owner      = $owner
         }
     }
+}
+
+function Get-DnsServerCollectionBundle {
+    # Per-server DNS collection, packaged as a pure function so it can run
+    # inside a RunspacePool worker (Invoke-ParallelServerCollection) — a
+    # worker can't safely mutate the main thread's $collected/$dnsData
+    # directly, so it hands back a self-contained bundle for the caller to
+    # merge. Same collection logic Main ran serially before parallelization.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ComputerName,
+        [Microsoft.Management.Infrastructure.CimSession] $CimSession,
+        [string[]] $ZoneFilter,
+        [bool] $IncludeReverseZones,
+        [bool] $RawDump
+    )
+
+    $bundle = [PSCustomObject]@{
+        ComputerName  = $ComputerName
+        Inventory     = $null
+        Zones         = @{}
+        CollectedRows = @{}
+        Errors        = [System.Collections.Generic.List[object]]::new()
+    }
+
+    try {
+        $inventory = Get-DnsInventory -ComputerName $ComputerName -CimSession $CimSession
+        $bundle.Inventory = $inventory
+        Add-CollectedRow -Collected $bundle.CollectedRows -Bucket 'DNS_Zones' -Rows $inventory.Zones
+
+        $zoneRows = $inventory.Zones
+        if ($ZoneFilter) { $zoneRows = $zoneRows | Where-Object { $_.ZoneName -in $ZoneFilter } }
+        if (-not $IncludeReverseZones) { $zoneRows = $zoneRows | Where-Object { $_.ZoneName -notmatch '\.(in-addr|ip6)\.arpa$' } }
+
+        foreach ($zoneRow in $zoneRows) {
+            $zoneName = $zoneRow.ZoneName
+            try {
+                $zoneDetail = Get-DnsZoneDetail -ComputerName $ComputerName -ZoneName $zoneName -CimSession $CimSession
+                Add-CollectedRow -Collected $bundle.CollectedRows -Bucket 'DNS_ZoneDetail' -Rows @($zoneDetail)
+
+                $recordRows = @(Get-DnsRecordDump -ComputerName $ComputerName -ZoneName $zoneName -CimSession $CimSession)
+                if ($RawDump) {
+                    Add-CollectedRow -Collected $bundle.CollectedRows -Bucket "DNS_Records_$(ConvertTo-SafeFileName $zoneName)" -Rows $recordRows
+                }
+
+                $bundle.Zones[$zoneName] = @{
+                    Detail         = $zoneDetail
+                    Records        = $recordRows
+                    IsReverseZone  = [bool]$zoneRow.IsReverseLookupZone
+                    IsDsIntegrated = [bool]$zoneRow.IsDsIntegrated
+                }
+            }
+            catch {
+                $bundle.Errors.Add((New-DiagResult -Category 'DNS' -TestName 'Zone Collection' -Target "$ComputerName\$zoneName" `
+                            -Status 'Error' -Finding "Failed to collect zone detail: $($_.Exception.Message)"))
+            }
+        }
+    }
+    catch {
+        $bundle.Errors.Add((New-DiagResult -Category 'DNS' -TestName 'Server Collection' -Target $ComputerName `
+                    -Status 'Error' -Finding "Failed to collect DNS inventory: $($_.Exception.Message)"))
+    }
+
+    $bundle
+}
+
+function Get-DhcpServerCollectionBundle {
+    # DHCP counterpart to Get-DnsServerCollectionBundle — see that function's
+    # comment for why this returns a bundle instead of mutating shared state.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ComputerName,
+        [Microsoft.Management.Infrastructure.CimSession] $CimSession,
+        [string[]] $ScopeFilter,
+        [bool] $RawDump
+    )
+
+    $bundle = [PSCustomObject]@{
+        ComputerName  = $ComputerName
+        Inventory     = $null
+        Scopes        = @{}
+        CollectedRows = @{}
+        Errors        = [System.Collections.Generic.List[object]]::new()
+    }
+
+    try {
+        $inventory = Get-DhcpInventory -ComputerName $ComputerName -CimSession $CimSession
+        $bundle.Inventory = $inventory
+        Add-CollectedRow -Collected $bundle.CollectedRows -Bucket 'DHCP_Servers' -Rows @($inventory)
+
+        $dhcpCimParam = if ($CimSession) { @{ CimSession = $CimSession } } else { @{ ComputerName = $ComputerName } }
+        $scopeIds = Get-DhcpServerv4Scope @dhcpCimParam -ErrorAction Stop | Select-Object -ExpandProperty ScopeId | ForEach-Object { $_.IPAddressToString }
+        if ($ScopeFilter) { $scopeIds = $scopeIds | Where-Object { $_ -in $ScopeFilter } }
+
+        foreach ($scopeId in $scopeIds) {
+            try {
+                $scopeDetail = Get-DhcpScopeDetail -ComputerName $ComputerName -ScopeId $scopeId -CimSession $CimSession
+                Add-CollectedRow -Collected $bundle.CollectedRows -Bucket 'DHCP_Scopes' -Rows @($scopeDetail | Select-Object * -ExcludeProperty Options, ExclusionRanges)
+                Add-CollectedRow -Collected $bundle.CollectedRows -Bucket 'DHCP_Options' -Rows @($scopeDetail.Options | ForEach-Object {
+                        [PSCustomObject]@{ DhcpServer = $ComputerName; ScopeId = $scopeId; OptionId = $_.OptionId; Name = $_.Name; Value = ($_.Value -join ',') }
+                    })
+
+                $leaseRows = @(Get-DhcpLeaseDump -ComputerName $ComputerName -ScopeId $scopeId -CimSession $CimSession)
+                if ($RawDump) {
+                    Add-CollectedRow -Collected $bundle.CollectedRows -Bucket "DHCP_Leases_$(ConvertTo-SafeFileName $scopeId)" -Rows $leaseRows
+                    Add-CollectedRow -Collected $bundle.CollectedRows -Bucket 'DHCP_Reservations' -Rows @($leaseRows | Where-Object Type -eq 'Reservation')
+                }
+
+                $bundle.Scopes[$scopeId] = @{ Detail = $scopeDetail; Leases = $leaseRows }
+            }
+            catch {
+                $bundle.Errors.Add((New-DiagResult -Category 'DHCP' -TestName 'Scope Collection' -Target "$ComputerName\$scopeId" `
+                            -Status 'Error' -Finding "Failed to collect scope detail: $($_.Exception.Message)"))
+            }
+        }
+    }
+    catch {
+        $bundle.Errors.Add((New-DiagResult -Category 'DHCP' -TestName 'Server Collection' -Target $ComputerName `
+                    -Status 'Error' -Finding "Failed to collect DHCP inventory: $($_.Exception.Message)"))
+    }
+
+    $bundle
 }
 
 #endregion Collectors
@@ -748,9 +1084,24 @@ function Test-DnsZoneReplication {
     )
 
     $hostingServers = @($DnsData.Keys | Where-Object { $DnsData[$_].Zones.ContainsKey($ZoneName) })
+    $missingFrom = @($DnsData.Keys | Where-Object { $_ -notin $hostingServers })
+
+    if ($hostingServers.Count -eq 0) {
+        return New-DiagResult -Category 'DNS' -TestName 'Zone Replication' -Target $ZoneName `
+            -Status 'Info' -Finding "Zone not observed on any of the $($DnsData.Keys.Count) queried DNS server(s)."
+    }
+
+    # "Missing from some servers" is meaningful even with just one hosting
+    # server, so it's checked before (and takes priority over) the
+    # consistency comparison below, which needs >=2 samples to mean anything.
+    if ($missingFrom.Count -gt 0) {
+        return New-DiagResult -Category 'DNS' -TestName 'Zone Replication' -Target $ZoneName `
+            -Status 'Warn' -Finding "Zone is missing from: $($missingFrom -join ', ')."
+    }
+
     if ($hostingServers.Count -le 1) {
         return New-DiagResult -Category 'DNS' -TestName 'Zone Replication' -Target $ZoneName `
-            -Status 'Info' -Finding "Zone observed on $($hostingServers.Count) of $($DnsData.Keys.Count) queried DNS server(s)."
+            -Status 'Info' -Finding "Zone observed on the only queried DNS server; nothing to compare for consistency."
     }
 
     $zoneInfos = $hostingServers | ForEach-Object {
@@ -760,16 +1111,11 @@ function Test-DnsZoneReplication {
 
     $inconsistent = (@($zoneInfos.ZoneType | Select-Object -Unique)).Count -gt 1 -or
         (@($zoneInfos.ReplicationScope | Select-Object -Unique)).Count -gt 1
-    $missingFrom = @($DnsData.Keys | Where-Object { $_ -notin $hostingServers })
 
     if ($inconsistent) {
         $summary = ($zoneInfos | ForEach-Object { "$($_.Server): Type=$($_.ZoneType), Repl=$($_.ReplicationScope)" }) -join '; '
         New-DiagResult -Category 'DNS' -TestName 'Zone Replication' -Target $ZoneName `
             -Status 'Fail' -Finding 'Zone type/replication scope is inconsistent across DNS servers.' -Detail $summary
-    }
-    elseif ($missingFrom.Count -gt 0) {
-        New-DiagResult -Category 'DNS' -TestName 'Zone Replication' -Target $ZoneName `
-            -Status 'Warn' -Finding "Zone is missing from: $($missingFrom -join ', ')."
     }
     else {
         New-DiagResult -Category 'DNS' -TestName 'Zone Replication' -Target $ZoneName `
@@ -1194,6 +1540,284 @@ function Test-DhcpConflictExclusions {
     $results
 }
 
+# --- DDNS tandem tests (design 5.4) ---
+
+function Test-DdnsUpdateSettings {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ComputerName,
+        [Parameter(Mandatory)] [string] $ScopeId,
+        [Parameter(Mandatory)] $ScopeSetting
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $target = "$ComputerName\$ScopeId"
+
+    $results.Add((New-DiagResult -Category 'DDNS' -TestName 'Dynamic Update Settings' -Target $target `
+            -Status 'Info' -Finding "DynamicUpdates=$($ScopeSetting.DynamicUpdates), NameProtection=$($ScopeSetting.NameProtection), UpdateDnsRRForOlderClients=$($ScopeSetting.UpdateDnsRRForOlderClients)."))
+
+    if ($ScopeSetting.DynamicUpdates -ne 'Never' -and -not $ScopeSetting.DeleteDnsRROnLeaseExpiry) {
+        $results.Add((New-DiagResult -Category 'DDNS' -TestName 'Lease Expiry Cleanup' -Target $target `
+                -Status 'Warn' -Finding 'Dynamic updates are enabled but DeleteDnsRROnLeaseExpiry is off; expired leases will leave orphaned DNS records behind.'))
+    }
+
+    $results
+}
+
+function Test-DdnsCredential {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ComputerName,
+        [Parameter(Mandatory)] $ServerSetting,
+        [Parameter(Mandatory)] [bool] $AnyScopeHasDynamicUpdates
+    )
+
+    if (-not $AnyScopeHasDynamicUpdates) {
+        return New-DiagResult -Category 'DDNS' -TestName 'DNS Update Credential' -Target $ComputerName `
+            -Status 'Info' -Finding 'Dynamic updates are disabled on all scopes; a dedicated credential is not applicable.'
+    }
+
+    if ($ServerSetting.DnsCredentialConfigured) {
+        New-DiagResult -Category 'DDNS' -TestName 'DNS Update Credential' -Target $ComputerName `
+            -Status 'Pass' -Finding "Registrations use dedicated credential $($ServerSetting.DnsCredentialUserName)."
+    }
+    else {
+        New-DiagResult -Category 'DDNS' -TestName 'DNS Update Credential' -Target $ComputerName `
+            -Status 'Fail' -Finding "No dedicated DNS update credential configured; records will be owned by this server's computer account, risking an ownership lockout on failover."
+    }
+}
+
+function Test-DdnsUpdateProxyHygiene {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ComputerName,
+        [Parameter(Mandatory)] $ServerSetting
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $computerAccount = Get-ComputerAccountName -ComputerName $ComputerName
+    $isProxyMember = $ServerSetting.DnsUpdateProxyMembers -contains $computerAccount
+
+    if ($isProxyMember -and -not $ServerSetting.NameProtection) {
+        $results.Add((New-DiagResult -Category 'DDNS' -TestName 'DnsUpdateProxy Membership' -Target $ComputerName `
+                -Status 'Warn' -Finding "$computerAccount is a DnsUpdateProxy member with Name Protection off; records it registers have no owner-based ACL protection (the known trade-off of this group)."))
+    }
+    elseif ($isProxyMember) {
+        $results.Add((New-DiagResult -Category 'DDNS' -TestName 'DnsUpdateProxy Membership' -Target $ComputerName `
+                -Status 'Info' -Finding "$computerAccount is a DnsUpdateProxy member; Name Protection is on, mitigating the usual trade-off."))
+    }
+
+    if ($ServerSetting.DnsCredentialConfigured) {
+        $credentialAccount = ($ServerSetting.DnsCredentialUserName -split '\\')[-1]
+        $proxyMatch = $ServerSetting.DnsUpdateProxyMembers | Where-Object { $_ -and ($_ -eq $credentialAccount -or $_ -eq "$credentialAccount`$") }
+        if ($proxyMatch) {
+            $results.Add((New-DiagResult -Category 'DDNS' -TestName 'DnsUpdateProxy Membership' -Target $ComputerName `
+                    -Status 'Warn' -Finding "Dedicated credential account '$($ServerSetting.DnsCredentialUserName)' also appears to be a DnsUpdateProxy member, which defeats the purpose of using a dedicated account."))
+        }
+    }
+
+    if ($results.Count -eq 0) {
+        $results.Add((New-DiagResult -Category 'DDNS' -TestName 'DnsUpdateProxy Membership' -Target $ComputerName `
+                -Status 'Pass' -Finding 'No DnsUpdateProxy hygiene issues detected.'))
+    }
+
+    $results
+}
+
+function Test-DdnsRecordOwnership {
+    # Bucket heuristics: DHCP computer/service accounts are matched against
+    # the environment-wide set of diagnosed DHCP servers (there's no hard
+    # structural link between a specific zone and the DHCP server(s) that
+    # register into it), so a Warn here is an environment-wide ownership
+    # signal, not proof that *this* zone's DHCP server lacks a credential.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ComputerName,
+        [Parameter(Mandatory)] [string] $ZoneName,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Ownership,
+        [string[]] $DhcpComputerAccounts,
+        [string[]] $DhcpServiceAccounts,
+        [bool] $AnyDhcpServerMissingCredential
+    )
+
+    if ($Ownership.Count -eq 0) {
+        return New-DiagResult -Category 'DDNS' -TestName 'Record Ownership' -Target "$ComputerName\$ZoneName" `
+            -Status 'Info' -Finding 'No dynamic records sampled for ownership analysis.'
+    }
+
+    $buckets = [ordered]@{ DhcpComputerAccount = 0; DhcpServiceAccount = 0; ClientSelfRegistered = 0; AdminStatic = 0; Unknown = 0 }
+    foreach ($row in $Ownership) {
+        if (-not $row.Owner) { $buckets.Unknown++; continue }
+        if ($DhcpComputerAccounts -and ($row.Owner -in $DhcpComputerAccounts)) { $buckets.DhcpComputerAccount++; continue }
+        if ($DhcpServiceAccounts -and ($row.Owner -in $DhcpServiceAccounts)) { $buckets.DhcpServiceAccount++; continue }
+        if ($row.Owner -match '\$$') { $buckets.ClientSelfRegistered++; continue }
+        $buckets.AdminStatic++
+    }
+
+    $summary = ($buckets.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', '
+
+    if ($buckets.DhcpComputerAccount -gt 0 -and $AnyDhcpServerMissingCredential) {
+        New-DiagResult -Category 'DDNS' -TestName 'Record Ownership' -Target "$ComputerName\$ZoneName" `
+            -Status 'Warn' -Finding "$($buckets.DhcpComputerAccount) sampled record(s) owned by a DHCP computer account, and at least one diagnosed DHCP server has no dedicated credential; those records risk an update lockout on failover." `
+            -Data ([PSCustomObject]$buckets)
+    }
+    else {
+        New-DiagResult -Category 'DDNS' -TestName 'Record Ownership' -Target "$ComputerName\$ZoneName" `
+            -Status 'Info' -Finding "Ownership breakdown of $($Ownership.Count) sampled record(s): $summary." `
+            -Data ([PSCustomObject]$buckets)
+    }
+}
+
+function Test-DdnsLeaseAgingAlignment {
+    # Correlates a scope to a collected DNS zone via the scope's option-015
+    # domain name — the only structural link available without assuming a
+    # naming convention. No result (not even Info) when no zone matches;
+    # that's "not applicable," not a finding.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ComputerName,
+        [Parameter(Mandatory)] $ScopeDetail,
+        [Parameter(Mandatory)] [hashtable] $DnsData
+    )
+
+    $domainOption = $ScopeDetail.Options | Where-Object OptionId -eq 15
+    if (-not $domainOption -or -not $domainOption.Value) { return $null }
+    $domainName = $domainOption.Value | Select-Object -First 1
+
+    $matchedZone = $null
+    foreach ($dnsServer in $DnsData.Keys) {
+        if ($DnsData[$dnsServer].Zones.ContainsKey($domainName)) {
+            $matchedZone = $DnsData[$dnsServer].Zones[$domainName]
+            break
+        }
+    }
+    if (-not $matchedZone -or -not $matchedZone.Detail.AgingEnabled) { return $null }
+    if (-not $matchedZone.Detail.NoRefreshInterval -or -not $matchedZone.Detail.RefreshInterval) { return $null }
+
+    $agingWindow = $matchedZone.Detail.NoRefreshInterval + $matchedZone.Detail.RefreshInterval
+    $leaseDuration = $ScopeDetail.LeaseDuration
+    $target = "$ComputerName\$($ScopeDetail.ScopeId) -> $domainName"
+    $data = [PSCustomObject]@{ AgingWindow = $agingWindow.ToString(); LeaseDuration = $leaseDuration.ToString() }
+
+    if ($agingWindow -lt $leaseDuration) {
+        New-DiagResult -Category 'DDNS' -TestName 'Lease/Aging Alignment' -Target $target `
+            -Status 'Warn' -Finding "Aging window ($agingWindow) is shorter than the DHCP lease duration ($leaseDuration); actively-leased records risk premature scavenging." -Data $data
+    }
+    else {
+        New-DiagResult -Category 'DDNS' -TestName 'Lease/Aging Alignment' -Target $target `
+            -Status 'Pass' -Finding "Aging window ($agingWindow) comfortably covers the DHCP lease duration ($leaseDuration)." -Data $data
+    }
+}
+
+function Test-DdnsPtrCoverage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ComputerName,
+        [Parameter(Mandatory)] $ScopeDetail,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Leases,
+        [Parameter(Mandatory)] [string] $EffectiveDynamicUpdates,
+        [Parameter(Mandatory)] [hashtable] $ReverseZoneIndex
+    )
+
+    if ($ReverseZoneIndex.Count -eq 0 -or $EffectiveDynamicUpdates -eq 'Never') { return $null }
+
+    $activeLeases = @($Leases | Where-Object { $_.Type -eq 'Lease' -and $_.AddressState -match 'Active' })
+    if ($activeLeases.Count -eq 0) {
+        return New-DiagResult -Category 'DDNS' -TestName 'PTR Coverage' -Target "$ComputerName\$($ScopeDetail.ScopeId)" `
+            -Status 'Info' -Finding 'No active leases to sample for PTR coverage.'
+    }
+
+    $sample = if ($activeLeases.Count -gt $script:DdnsProbeSampleSize) { $activeLeases | Get-Random -Count $script:DdnsProbeSampleSize } else { $activeLeases }
+
+    $checked = 0
+    $missing = @()
+    foreach ($lease in $sample) {
+        $ptrInfo = ConvertTo-PtrZoneAndHost -IPAddress $lease.IPAddress
+        if (-not $ptrInfo -or -not $ReverseZoneIndex.ContainsKey($ptrInfo.ZoneName)) { continue }
+        $checked++
+        $hasPtr = [bool]($ReverseZoneIndex[$ptrInfo.ZoneName] | Where-Object { $_.RecordType -eq 'PTR' -and $_.HostName -eq $ptrInfo.HostName })
+        if (-not $hasPtr) { $missing += $lease.IPAddress }
+    }
+
+    if ($checked -eq 0) {
+        return New-DiagResult -Category 'DDNS' -TestName 'PTR Coverage' -Target "$ComputerName\$($ScopeDetail.ScopeId)" `
+            -Status 'Info' -Finding 'No sampled leases fell inside a collected reverse zone; PTR coverage could not be verified.'
+    }
+
+    if ($missing.Count -gt 0) {
+        New-DiagResult -Category 'DDNS' -TestName 'PTR Coverage' -Target "$ComputerName\$($ScopeDetail.ScopeId)" `
+            -Status 'Warn' -Finding "$($missing.Count) of $checked sampled active lease(s) have no matching PTR record." -Detail ($missing -join ', ')
+    }
+    else {
+        New-DiagResult -Category 'DDNS' -TestName 'PTR Coverage' -Target "$ComputerName\$($ScopeDetail.ScopeId)" `
+            -Status 'Pass' -Finding "All $checked sampled active lease(s) have a matching PTR record."
+    }
+}
+
+function Test-DdnsLiveRegistration {
+    # The design's "single highest-value tandem test": does DNS actually
+    # reflect what DHCP handed out? Read-only — a resolver query, never a
+    # DNS/DHCP write.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ComputerName,
+        [Parameter(Mandatory)] $ScopeDetail,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Leases,
+        [Parameter(Mandatory)] [string[]] $DnsServers
+    )
+
+    if (-not $DnsServers) { return $null }
+
+    $domainOption = $ScopeDetail.Options | Where-Object OptionId -eq 15
+    $domainSuffix = if ($domainOption -and $domainOption.Value) { $domainOption.Value | Select-Object -First 1 } else { $null }
+
+    $activeLeases = @($Leases | Where-Object { $_.Type -eq 'Lease' -and $_.AddressState -match 'Active' -and $_.HostName })
+    if ($activeLeases.Count -eq 0) {
+        return New-DiagResult -Category 'DDNS' -TestName 'Live Registration Probe' -Target "$ComputerName\$($ScopeDetail.ScopeId)" `
+            -Status 'Info' -Finding 'No active leases with a hostname to probe.'
+    }
+
+    $sample = if ($activeLeases.Count -gt $script:DdnsProbeSampleSize) { $activeLeases | Get-Random -Count $script:DdnsProbeSampleSize } else { $activeLeases }
+    $probeServer = $DnsServers | Select-Object -First 1
+
+    $mismatches = @()
+    $noRecord = 0
+    $probed = 0
+    foreach ($lease in $sample) {
+        $fqdn = if ($lease.HostName -match '\.') { $lease.HostName } elseif ($domainSuffix) { "$($lease.HostName).$domainSuffix" } else { $null }
+        if (-not $fqdn) { continue }
+        $probed++
+
+        try {
+            $answer = Resolve-DnsName -Server $probeServer -Name $fqdn -Type A -QuickTimeout -ErrorAction Stop
+            $resolvedIp = $answer | Where-Object Type -eq 'A' | Select-Object -First 1 -ExpandProperty IPAddress
+            if (-not $resolvedIp) { $noRecord++ }
+            elseif ($resolvedIp -ne $lease.IPAddress) { $mismatches += "$fqdn -> DNS=$resolvedIp, lease=$($lease.IPAddress)" }
+        }
+        catch {
+            $noRecord++
+        }
+    }
+
+    if ($probed -eq 0) {
+        return New-DiagResult -Category 'DDNS' -TestName 'Live Registration Probe' -Target "$ComputerName\$($ScopeDetail.ScopeId)" `
+            -Status 'Info' -Finding 'No sampled leases had a resolvable hostname (no domain-name option to build an FQDN).'
+    }
+
+    if ($mismatches.Count -gt 0) {
+        New-DiagResult -Category 'DDNS' -TestName 'Live Registration Probe' -Target "$ComputerName\$($ScopeDetail.ScopeId)" `
+            -Status 'Fail' -Finding "$($mismatches.Count) of $probed probed lease(s) resolve to a different IP than leased — broken DDNS registration." -Detail ($mismatches -join '; ')
+    }
+    elseif ($noRecord -gt 0) {
+        New-DiagResult -Category 'DDNS' -TestName 'Live Registration Probe' -Target "$ComputerName\$($ScopeDetail.ScopeId)" `
+            -Status 'Warn' -Finding "$noRecord of $probed probed lease(s) have no DNS record at all."
+    }
+    else {
+        New-DiagResult -Category 'DDNS' -TestName 'Live Registration Probe' -Target "$ComputerName\$($ScopeDetail.ScopeId)" `
+            -Status 'Pass' -Finding "All $probed probed lease(s) resolve to their leased IP."
+    }
+}
+
 #endregion Analyzers
 
 #region Renderers
@@ -1299,6 +1923,90 @@ function Show-SummaryReport {
     Write-Host ''
 }
 
+function Export-HtmlReport {
+    # Single self-contained HTML file — inline CSS only, no external
+    # assets (design section 6.2). Pure renderer like Show-SummaryReport:
+    # consumes $Results/$RunContext only, no data access of its own.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Results,
+        [Parameter(Mandatory)] $RunContext,
+        [Parameter(Mandatory)] [string] $OutputPath
+    )
+
+    function ConvertTo-HtmlText([string] $Text) {
+        [System.Net.WebUtility]::HtmlEncode($Text)
+    }
+
+    $severityOrder = @{ Fail = 0; Error = 1; Warn = 2; Info = 3; Pass = 4 }
+    $statusClass = @{ Fail = 'status-fail'; Error = 'status-error'; Warn = 'status-warn'; Info = 'status-info'; Pass = 'status-pass' }
+    $sortedResults = $Results | Sort-Object { $severityOrder[$_.Status] }, Category, TestName
+
+    $rowsHtml = ($sortedResults | ForEach-Object {
+            $class = $statusClass[$_.Status]
+            $dataText = if ($_.Data) { ($_.Data.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join '; ' } else { '' }
+            $detailText = $_.Detail
+            if ($dataText) { $detailText = "$detailText ($dataText)".Trim() }
+            "<tr class='$class'><td>$(ConvertTo-HtmlText $_.Category)</td><td>$(ConvertTo-HtmlText $_.TestName)</td><td>$(ConvertTo-HtmlText $_.Target)</td><td>$(ConvertTo-HtmlText $_.Status)</td><td>$(ConvertTo-HtmlText $_.Finding)</td><td>$(ConvertTo-HtmlText $detailText)</td></tr>"
+        }) -join "`n"
+
+    $categorySummary = ($Results | Group-Object Category | ForEach-Object {
+            $counts = $_.Group | Group-Object Status | Sort-Object { $severityOrder[$_.Name] } | ForEach-Object { "$($_.Count) $($_.Name)" }
+            "<li><strong>$(ConvertTo-HtmlText $_.Name):</strong> $(ConvertTo-HtmlText ($counts -join ' / '))</li>"
+        }) -join "`n"
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>DNS/DHCP Diagnostics Report</title>
+<style>
+    body { font-family: 'Segoe UI', Arial, sans-serif; margin: 2em; color: #1a1a1a; background: #fafafa; }
+    h1 { font-size: 1.4em; }
+    .meta { color: #444; margin-bottom: 1.5em; }
+    .meta div { margin: 0.2em 0; }
+    ul.summary { list-style: none; padding: 0; margin-bottom: 1.5em; }
+    ul.summary li { margin: 0.3em 0; }
+    table { border-collapse: collapse; width: 100%; font-size: 0.9em; }
+    th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; vertical-align: top; }
+    th { background: #333; color: #fff; position: sticky; top: 0; }
+    tr.status-fail { background: #fde2e1; }
+    tr.status-error { background: #f6d6a8; }
+    tr.status-warn { background: #fdf3cd; }
+    tr.status-info { background: #e6f0fa; }
+    tr.status-pass { background: #e6f6e8; }
+    footer { margin-top: 1.5em; color: #777; font-size: 0.85em; }
+</style>
+</head>
+<body>
+<h1>DNS/DHCP Diagnostics Report</h1>
+<div class="meta">
+    <div><strong>DNS servers:</strong> $(ConvertTo-HtmlText ($RunContext.DnsServers -join ', '))</div>
+    <div><strong>DHCP servers:</strong> $(ConvertTo-HtmlText ($RunContext.DhcpServers -join ', '))</div>
+    <div><strong>Zones:</strong> $($RunContext.ZoneCount) &nbsp; <strong>Scopes:</strong> $($RunContext.ScopeCount)</div>
+    <div><strong>Run as:</strong> $(ConvertTo-HtmlText $RunContext.CredentialUserName)</div>
+    <div><strong>Started:</strong> $($RunContext.StartTime) &nbsp; <strong>Duration:</strong> $($RunContext.Duration.ToString('mm\:ss'))</div>
+</div>
+<ul class="summary">
+$categorySummary
+</ul>
+<table>
+<thead><tr><th>Category</th><th>Test</th><th>Target</th><th>Status</th><th>Finding</th><th>Detail</th></tr></thead>
+<tbody>
+$rowsHtml
+</tbody>
+</table>
+<footer>Generated $(Get-Date) by Invoke-DnsDhcpDiagnostics.ps1 — read-only diagnostics; no changes were made to DNS/DHCP.</footer>
+</body>
+</html>
+"@
+
+    $htmlPath = Join-Path $OutputPath 'Report.html'
+    Set-Content -Path $htmlPath -Value $html -Encoding UTF8
+    Write-DiagLog "HTML report written to $htmlPath"
+}
+
 #endregion Renderers
 
 #region Main
@@ -1348,112 +2056,100 @@ function Invoke-Main {
     }
 
     # ============================================================
-    # Stage 1: Collection — same collectors as Phase 1, but staged into
-    # $dnsData/$dhcpData (keyed by server, then zone/scope) so Stage 2
-    # analyzers get full cross-server/cross-scope visibility instead of
-    # a single interleaved pass. Record/lease dumps are now always fetched
-    # (analyzers need them); -RawDump still only controls whether they're
-    # also written out as CSV.
+    # Stage 1: Collection — per-server work dispatched across a
+    # RunspacePool (Invoke-ParallelServerCollection) instead of a serial
+    # loop; each server's Get-*ServerCollectionBundle result is merged
+    # into $dnsData/$dhcpData (keyed by server, then zone/scope) back on
+    # the main thread so Stage 2 analyzers get the same cross-server/
+    # cross-scope visibility Phase 2 established. Record/lease dumps are
+    # always fetched (analyzers need them); -RawDump only controls
+    # whether they're also written out as CSV.
     # ============================================================
     $dnsData = @{}
     $dhcpData = @{}
 
-    if ($effectiveTests -contains 'Dns') {
-        foreach ($dnsServer in $reachableDns) {
-            Write-DiagLog "Collecting DNS inventory from $dnsServer"
-            try {
-                $inventory = Get-DnsInventory -ComputerName $dnsServer -CimSession $dnsCim[$dnsServer]
-                Add-CollectedRow -Collected $collected -Bucket 'DNS_Zones' -Rows $inventory.Zones
-                $dnsData[$dnsServer] = @{ Inventory = $inventory; Zones = @{} }
+    if ($effectiveTests -contains 'Dns' -or $effectiveTests -contains 'Ddns') {
+        Write-DiagLog "Collecting DNS inventory from $($reachableDns.Count) server(s) (throttle=$script:ParallelThrottleLimit, timeout=${script:CollectionTimeoutSeconds}s)."
+        $dnsWorkItems = @($reachableDns | ForEach-Object { [PSCustomObject]@{ ComputerName = $_; CimSession = $dnsCim[$_] } })
 
-                $zoneRows = $inventory.Zones
-                if ($Zone) { $zoneRows = $zoneRows | Where-Object { $_.ZoneName -in $Zone } }
-                if (-not $IncludeReverseZones) { $zoneRows = $zoneRows | Where-Object { $_.ZoneName -notmatch '\.(in-addr|ip6)\.arpa$' } }
+        $dnsJobResults = Invoke-ParallelServerCollection -InputObject $dnsWorkItems `
+            -ArgumentList @($Zone, [bool]$IncludeReverseZones, [bool]$RawDump) -ScriptBlock {
+            param($item, $zoneFilter, $includeReverse, $rawDump)
+            Get-DnsServerCollectionBundle -ComputerName $item.ComputerName -CimSession $item.CimSession `
+                -ZoneFilter $zoneFilter -IncludeReverseZones $includeReverse -RawDump $rawDump
+        }
 
-                foreach ($zoneRow in $zoneRows) {
-                    $zoneName = $zoneRow.ZoneName
-                    try {
-                        $zoneDetail = Get-DnsZoneDetail -ComputerName $dnsServer -ZoneName $zoneName -CimSession $dnsCim[$dnsServer]
-                        Add-CollectedRow -Collected $collected -Bucket 'DNS_ZoneDetail' -Rows @($zoneDetail)
-
-                        $recordRows = @(Get-DnsRecordDump -ComputerName $dnsServer -ZoneName $zoneName -CimSession $dnsCim[$dnsServer])
-                        if ($RawDump) {
-                            Add-CollectedRow -Collected $collected -Bucket "DNS_Records_$(ConvertTo-SafeFileName $zoneName)" -Rows $recordRows
-                        }
-
-                        $dnsData[$dnsServer].Zones[$zoneName] = @{
-                            Detail       = $zoneDetail
-                            Records      = $recordRows
-                            IsReverseZone = [bool]$zoneRow.IsReverseLookupZone
-                        }
-                    }
-                    catch {
-                        $results.Add((New-DiagResult -Category 'DNS' -TestName 'Zone Collection' -Target "$dnsServer\$zoneName" `
-                                    -Status 'Error' -Finding "Failed to collect zone detail: $($_.Exception.Message)"))
-                    }
-                }
-            }
-            catch {
+        foreach ($jobResult in $dnsJobResults) {
+            $dnsServer = $jobResult.Item.ComputerName
+            if ($jobResult.TimedOut) {
                 $results.Add((New-DiagResult -Category 'DNS' -TestName 'Server Collection' -Target $dnsServer `
-                            -Status 'Error' -Finding "Failed to collect DNS inventory: $($_.Exception.Message)"))
+                            -Status 'Error' -Finding "Collection timed out: $($jobResult.Error)"))
+                continue
             }
+            if ($jobResult.Error) {
+                Write-DiagLog "Non-fatal collector error(s) on $dnsServer : $($jobResult.Error)" 'WARN'
+            }
+
+            $bundle = $jobResult.Output
+            if (-not $bundle) { continue }
+
+            $dnsData[$dnsServer] = @{ Inventory = $bundle.Inventory; Zones = $bundle.Zones }
+            foreach ($bucket in $bundle.CollectedRows.Keys) {
+                Add-CollectedRow -Collected $collected -Bucket $bucket -Rows $bundle.CollectedRows[$bucket]
+            }
+            foreach ($err in $bundle.Errors) { $results.Add($err) }
         }
     }
 
-    if ($effectiveTests -contains 'Dhcp') {
-        foreach ($dhcpServer in $reachableDhcp) {
-            Write-DiagLog "Collecting DHCP inventory from $dhcpServer"
-            try {
-                $inventory = Get-DhcpInventory -ComputerName $dhcpServer -CimSession $dhcpCim[$dhcpServer]
-                Add-CollectedRow -Collected $collected -Bucket 'DHCP_Servers' -Rows @($inventory)
-                $dhcpData[$dhcpServer] = @{ Inventory = $inventory; Scopes = @{} }
+    if ($effectiveTests -contains 'Dhcp' -or $effectiveTests -contains 'Ddns') {
+        Write-DiagLog "Collecting DHCP inventory from $($reachableDhcp.Count) server(s) (throttle=$script:ParallelThrottleLimit, timeout=${script:CollectionTimeoutSeconds}s)."
+        $dhcpWorkItems = @($reachableDhcp | ForEach-Object { [PSCustomObject]@{ ComputerName = $_; CimSession = $dhcpCim[$_] } })
 
-                $dhcpCimParam = if ($dhcpCim[$dhcpServer]) { @{ CimSession = $dhcpCim[$dhcpServer] } } else { @{ ComputerName = $dhcpServer } }
-                $scopeIds = Get-DhcpServerv4Scope @dhcpCimParam -ErrorAction Stop | Select-Object -ExpandProperty ScopeId | ForEach-Object { $_.IPAddressToString }
-                if ($Scope) { $scopeIds = $scopeIds | Where-Object { $_ -in $Scope } }
+        $dhcpJobResults = Invoke-ParallelServerCollection -InputObject $dhcpWorkItems `
+            -ArgumentList @($Scope, [bool]$RawDump) -ScriptBlock {
+            param($item, $scopeFilter, $rawDump)
+            Get-DhcpServerCollectionBundle -ComputerName $item.ComputerName -CimSession $item.CimSession `
+                -ScopeFilter $scopeFilter -RawDump $rawDump
+        }
 
-                foreach ($scopeId in $scopeIds) {
-                    try {
-                        $scopeDetail = Get-DhcpScopeDetail -ComputerName $dhcpServer -ScopeId $scopeId -CimSession $dhcpCim[$dhcpServer]
-                        Add-CollectedRow -Collected $collected -Bucket 'DHCP_Scopes' -Rows @($scopeDetail | Select-Object * -ExcludeProperty Options, ExclusionRanges)
-                        Add-CollectedRow -Collected $collected -Bucket 'DHCP_Options' -Rows @($scopeDetail.Options | ForEach-Object {
-                                [PSCustomObject]@{ DhcpServer = $dhcpServer; ScopeId = $scopeId; OptionId = $_.OptionId; Name = $_.Name; Value = ($_.Value -join ',') }
-                            })
-
-                        $leaseRows = @(Get-DhcpLeaseDump -ComputerName $dhcpServer -ScopeId $scopeId -CimSession $dhcpCim[$dhcpServer])
-                        if ($RawDump) {
-                            Add-CollectedRow -Collected $collected -Bucket "DHCP_Leases_$(ConvertTo-SafeFileName $scopeId)" -Rows $leaseRows
-                            Add-CollectedRow -Collected $collected -Bucket 'DHCP_Reservations' -Rows @($leaseRows | Where-Object Type -eq 'Reservation')
-                        }
-
-                        $dhcpData[$dhcpServer].Scopes[$scopeId] = @{ Detail = $scopeDetail; Leases = $leaseRows }
-                    }
-                    catch {
-                        $results.Add((New-DiagResult -Category 'DHCP' -TestName 'Scope Collection' -Target "$dhcpServer\$scopeId" `
-                                    -Status 'Error' -Finding "Failed to collect scope detail: $($_.Exception.Message)"))
-                    }
-                }
-            }
-            catch {
+        foreach ($jobResult in $dhcpJobResults) {
+            $dhcpServer = $jobResult.Item.ComputerName
+            if ($jobResult.TimedOut) {
                 $results.Add((New-DiagResult -Category 'DHCP' -TestName 'Server Collection' -Target $dhcpServer `
-                            -Status 'Error' -Finding "Failed to collect DHCP inventory: $($_.Exception.Message)"))
+                            -Status 'Error' -Finding "Collection timed out: $($jobResult.Error)"))
+                continue
             }
+            if ($jobResult.Error) {
+                Write-DiagLog "Non-fatal collector error(s) on $dhcpServer : $($jobResult.Error)" 'WARN'
+            }
+
+            $bundle = $jobResult.Output
+            if (-not $bundle) { continue }
+
+            $dhcpData[$dhcpServer] = @{ Inventory = $bundle.Inventory; Scopes = $bundle.Scopes }
+            foreach ($bucket in $bundle.CollectedRows.Keys) {
+                Add-CollectedRow -Collected $collected -Bucket $bucket -Rows $bundle.CollectedRows[$bucket]
+            }
+            foreach ($err in $bundle.Errors) { $results.Add($err) }
         }
     }
 
-    # --- DDNS raw config collection (analysis lands in Phase 3) ---
+    # --- DDNS raw config collection (design 5.4; analyzed in Stage 2 below) ---
+    # Reuses the server/zone/scope sets already discovered by the Dns/Dhcp
+    # blocks above (which now also run when only 'Ddns' was requested,
+    # since the tandem analyzers need both sides' data to correlate).
+    $ddnsData = @{}
     if ($effectiveTests -contains 'Ddns') {
-        foreach ($dhcpServer in $reachableDhcp) {
+        foreach ($dhcpServer in $dhcpData.Keys) {
             try {
                 $serverSetting = Get-DdnsConfiguration -ComputerName $dhcpServer -CimSession $dhcpCim[$dhcpServer]
                 Add-CollectedRow -Collected $collected -Bucket 'DHCP_DdnsSettings' -Rows @($serverSetting)
+                $ddnsData[$dhcpServer] = @{ ServerSetting = $serverSetting; Scopes = @{} }
 
-                $dhcpCimParam = if ($dhcpCim[$dhcpServer]) { @{ CimSession = $dhcpCim[$dhcpServer] } } else { @{ ComputerName = $dhcpServer } }
-                $scopeIds = Get-DhcpServerv4Scope @dhcpCimParam -ErrorAction Stop | Select-Object -ExpandProperty ScopeId | ForEach-Object { $_.IPAddressToString }
-                if ($Scope) { $scopeIds = $scopeIds | Where-Object { $_ -in $Scope } }
-                foreach ($scopeId in $scopeIds) {
+                foreach ($scopeId in $dhcpData[$dhcpServer].Scopes.Keys) {
                     $scopeSetting = Get-DdnsConfiguration -ComputerName $dhcpServer -ScopeId $scopeId -CimSession $dhcpCim[$dhcpServer]
                     Add-CollectedRow -Collected $collected -Bucket 'DHCP_DdnsSettings' -Rows @($scopeSetting)
+                    $ddnsData[$dhcpServer].Scopes[$scopeId] = $scopeSetting
                 }
             }
             catch {
@@ -1462,27 +2158,19 @@ function Invoke-Main {
             }
         }
 
-        foreach ($dnsServer in $reachableDns) {
-            try {
-                $inventory = Get-DnsInventory -ComputerName $dnsServer -CimSession $dnsCim[$dnsServer]
-                $zoneNames = $inventory.Zones | Where-Object IsDsIntegrated | Select-Object -ExpandProperty ZoneName
-                if ($Zone) { $zoneNames = $zoneNames | Where-Object { $_ -in $Zone } }
-                if (-not $IncludeReverseZones) { $zoneNames = $zoneNames | Where-Object { $_ -notmatch '\.(in-addr|ip6)\.arpa$' } }
-
-                foreach ($zoneName in $zoneNames) {
-                    try {
-                        $ownershipRows = @(Get-RecordOwnership -ComputerName $dnsServer -ZoneName $zoneName -FullScan:$FullOwnershipScan)
-                        Add-CollectedRow -Collected $collected -Bucket 'DNS_RecordOwnership' -Rows $ownershipRows
-                    }
-                    catch {
-                        $results.Add((New-DiagResult -Category 'DDNS' -TestName 'Record Ownership Sampling' -Target "$dnsServer\$zoneName" `
-                                    -Status 'Error' -Finding "Failed to sample record ownership: $($_.Exception.Message)"))
-                    }
+        foreach ($dnsServer in $dnsData.Keys) {
+            $dsIntegratedZones = $dnsData[$dnsServer].Zones.GetEnumerator() | Where-Object { $_.Value.IsDsIntegrated }
+            foreach ($zoneEntry in $dsIntegratedZones) {
+                $zoneName = $zoneEntry.Key
+                try {
+                    $ownershipRows = @(Get-RecordOwnership -ComputerName $dnsServer -ZoneName $zoneName -FullScan:$FullOwnershipScan)
+                    Add-CollectedRow -Collected $collected -Bucket 'DNS_RecordOwnership' -Rows $ownershipRows
+                    $zoneEntry.Value.Ownership = $ownershipRows
                 }
-            }
-            catch {
-                $results.Add((New-DiagResult -Category 'DDNS' -TestName 'Record Ownership Sampling' -Target $dnsServer `
-                            -Status 'Error' -Finding "Failed to enumerate zones for ownership sampling: $($_.Exception.Message)"))
+                catch {
+                    $results.Add((New-DiagResult -Category 'DDNS' -TestName 'Record Ownership Sampling' -Target "$dnsServer\$zoneName" `
+                                -Status 'Error' -Finding "Failed to sample record ownership: $($_.Exception.Message)"))
+                }
             }
         }
     }
@@ -1568,6 +2256,55 @@ function Invoke-Main {
         }
     }
 
+    # DDNS tandem tests (5.4) — only meaningful once DDNS config was collected (-Tests Ddns/All).
+    if ($ddnsData.Count -gt 0) {
+        # Environment-wide heuristic: there's no hard structural link between a
+        # given zone and the DHCP server(s) that register into it, so these
+        # sets span every diagnosed DHCP server rather than being zone-specific.
+        $dhcpComputerAccounts = @($ddnsData.Keys | ForEach-Object { Get-ComputerAccountName -ComputerName $_ })
+        $dhcpServiceAccounts = @($ddnsData.Values | Where-Object { $_.ServerSetting.DnsCredentialConfigured } |
+                ForEach-Object { ($_.ServerSetting.DnsCredentialUserName -split '\\')[-1] })
+        $anyDhcpServerMissingCredential = [bool]($ddnsData.Values | Where-Object {
+                -not $_.ServerSetting.DnsCredentialConfigured -and ($_.Scopes.Values | Where-Object { $_.DynamicUpdates -ne 'Never' })
+            })
+
+        $reverseZoneIndex = @{}
+        foreach ($dnsServer in $dnsData.Keys) {
+            foreach ($zEntry in $dnsData[$dnsServer].Zones.GetEnumerator()) {
+                if ($zEntry.Value.IsReverseZone -and -not $reverseZoneIndex.ContainsKey($zEntry.Key)) {
+                    $reverseZoneIndex[$zEntry.Key] = $zEntry.Value.Records
+                }
+            }
+        }
+
+        foreach ($dhcpServer in $ddnsData.Keys) {
+            $serverSetting = $ddnsData[$dhcpServer].ServerSetting
+            $anyScopeHasDynamicUpdates = [bool]($ddnsData[$dhcpServer].Scopes.Values | Where-Object { $_.DynamicUpdates -ne 'Never' })
+
+            Invoke-Analyzer -ResultList $results -Category 'DDNS' -TestName 'DNS Update Credential' -Target $dhcpServer -ScriptBlock { Test-DdnsCredential -ComputerName $dhcpServer -ServerSetting $serverSetting -AnyScopeHasDynamicUpdates $anyScopeHasDynamicUpdates }
+            Invoke-Analyzer -ResultList $results -Category 'DDNS' -TestName 'DnsUpdateProxy Membership' -Target $dhcpServer -ScriptBlock { Test-DdnsUpdateProxyHygiene -ComputerName $dhcpServer -ServerSetting $serverSetting }
+
+            foreach ($scopeId in $ddnsData[$dhcpServer].Scopes.Keys) {
+                $scopeSetting = $ddnsData[$dhcpServer].Scopes[$scopeId]
+                $scopeEntry = $dhcpData[$dhcpServer].Scopes[$scopeId]
+
+                Invoke-Analyzer -ResultList $results -Category 'DDNS' -TestName 'Dynamic Update Settings' -Target "$dhcpServer\$scopeId" -ScriptBlock { Test-DdnsUpdateSettings -ComputerName $dhcpServer -ScopeId $scopeId -ScopeSetting $scopeSetting }
+                Invoke-Analyzer -ResultList $results -Category 'DDNS' -TestName 'Lease/Aging Alignment' -Target "$dhcpServer\$scopeId" -ScriptBlock { Test-DdnsLeaseAgingAlignment -ComputerName $dhcpServer -ScopeDetail $scopeEntry.Detail -DnsData $dnsData }
+                Invoke-Analyzer -ResultList $results -Category 'DDNS' -TestName 'PTR Coverage' -Target "$dhcpServer\$scopeId" -ScriptBlock { Test-DdnsPtrCoverage -ComputerName $dhcpServer -ScopeDetail $scopeEntry.Detail -Leases $scopeEntry.Leases -EffectiveDynamicUpdates $scopeSetting.DynamicUpdates -ReverseZoneIndex $reverseZoneIndex }
+                Invoke-Analyzer -ResultList $results -Category 'DDNS' -TestName 'Live Registration Probe' -Target "$dhcpServer\$scopeId" -ScriptBlock { Test-DdnsLiveRegistration -ComputerName $dhcpServer -ScopeDetail $scopeEntry.Detail -Leases $scopeEntry.Leases -DnsServers $targets.DnsServers }
+            }
+        }
+
+        foreach ($dnsServer in $dnsData.Keys) {
+            foreach ($zEntry in $dnsData[$dnsServer].Zones.GetEnumerator()) {
+                if (-not $zEntry.Value.ContainsKey('Ownership')) { continue }
+                $zoneName = $zEntry.Key
+                $ownership = $zEntry.Value.Ownership
+                Invoke-Analyzer -ResultList $results -Category 'DDNS' -TestName 'Record Ownership' -Target "$dnsServer\$zoneName" -ScriptBlock { Test-DdnsRecordOwnership -ComputerName $dnsServer -ZoneName $zoneName -Ownership $ownership -DhcpComputerAccounts $dhcpComputerAccounts -DhcpServiceAccounts $dhcpServiceAccounts -AnyDhcpServerMissingCredential $anyDhcpServerMissingCredential }
+            }
+        }
+    }
+
     $duration = (Get-Date) - $startTime
     $runContext = [PSCustomObject]@{
         DnsServers         = $targets.DnsServers
@@ -1582,6 +2319,9 @@ function Invoke-Main {
 
     if ($Mode -in 'Export', 'Both') {
         Export-Results -Results $results -Collected $collected -OutputPath $OutputPath -RawDump:$RawDump
+        if ($HtmlReport) {
+            Export-HtmlReport -Results $results -RunContext $runContext -OutputPath $OutputPath
+        }
     }
     if ($Mode -in 'Report', 'Both') {
         Show-SummaryReport -Results $results -RunContext $runContext
@@ -1599,6 +2339,10 @@ function Invoke-Main {
     }
 }
 
-Invoke-Main
+# Skipped when dot-sourced (InvocationName is '.') so Pester can load every
+# function definition below without triggering a real, failing-by-default run.
+if ($MyInvocation.InvocationName -ne '.') {
+    Invoke-Main
+}
 
 #endregion Main
