@@ -1,0 +1,96 @@
+Install-Module PSPKI -Scope CurrentUser
+Import-Module PSPKI
+
+Get-CertificationAuthority -ComputerName "your-ca.domain.local" |
+    Select-Object Name, ComputerName
+
+Copy-Item `
+    .\config\settings.example.json `
+    .\config\settings.local.json
+
+notepad .\config\settings.local.json
+
+
+{
+  "DatabasePath": "../data/enterprise-validation.sqlite",
+  "MockMode": false,
+  "IssuingCAs": [
+    {
+      "Name": "YOUR-CA-NAME",
+      "ComputerName": "your-ca.domain.local"
+    }
+  ],
+  "Templates": {
+    "Include": [
+      "YourCertificateTemplateName"
+    ],
+    "Exclude": []
+  },
+  "Collection": {
+    "PageSize": 100,
+    "FullReconcileIntervalDays": 7,
+    "MaxRecordsPerScope": 50000
+  }
+}
+
+
+
+Import-Module PSPKI
+
+$CA = Get-CertificationAuthority `
+    -ComputerName "your-ca.domain.local" |
+    Where-Object Name -eq "YOUR-CA-NAME"
+
+$Template = "YourCertificateTemplateName"
+
+# Retrieve at most five issued certificate records
+$Sample = @(
+    Get-IssuedRequest `
+        -CertificationAuthority $CA `
+        -Filter @(
+            "CertificateTemplate -eq $Template"
+            "RequestID -gt 0"
+        ) `
+        -Page 1 `
+        -PageSize 5
+)
+
+# Inspect the returned objects
+$Sample | Select-Object `
+    RequestID,
+    CertificateTemplate,
+    NotAfter,
+    CommonName
+
+
+
+Import-Module .\src\CLM.psm1 -Force
+
+Sync-CLMCertificates `
+    -ConfigPath .\config\settings.local.json `
+    -DryRun `
+    -Full `
+    -Verbose |
+    Format-List *
+
+
+Sync-CLMCertificates `
+    -ConfigPath .\config\settings.local.json `
+    -Full
+
+# Check collection history
+Get-CLMCollectionRun `
+    -ConfigPath .\config\settings.local.json
+
+# Check collection cursor
+Get-CLMCollectionState `
+    -ConfigPath .\config\settings.local.json
+
+# Validate SQLite integrity
+Test-CLMDatabase `
+    -ConfigPath .\config\settings.local.json
+
+# Display first 10 certificates
+Get-CLMCertificate `
+    -ConfigPath .\config\settings.local.json |
+    Select-Object -First 10
